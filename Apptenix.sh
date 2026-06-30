@@ -9,7 +9,7 @@ set -o errexit
 set -o pipefail
 set -o nounset
 
-VERSION_LOCAL="1.0.5"
+VERSION_LOCAL="1.1"
 
 # ============================
 # Colores
@@ -57,7 +57,6 @@ check_dependencies() {
   local deps=(tar unzip)
   for d in "${deps[@]}"; do require_cmd "$d"; done
 
-  # rsync es mejor; si no está, seguimos con cp
   if ! command -v rsync >/dev/null 2>&1; then
     warn "No se encontró 'rsync'. Se usará 'cp' como alternativa."
   fi
@@ -141,7 +140,12 @@ instalar_aplicacion() {
   TEMP_DIR=$(mktemp -d -t install-app-XXXXXX)
   trap 'info "Limpiando archivos temporales..."; rm -rf "$TEMP_DIR"' EXIT
 
-  local EXEC_PATH
+  local EXEC_PATH=""
+  local ICON_PATH=""
+  local APP_NAME=""
+  local IS_OFFICIAL=false
+  local OFFICIAL_DESKTOP=""
+
   if [ -f "$INPUT_FILE" ] && [ -x "$INPUT_FILE" ] && ! [[ "$INPUT_FILE" =~ \.zip$|\.tar\..*$|\.tgz$|\.7z$ ]]; then
     info "Se detectó un archivo binario simple."
     cp "$INPUT_FILE" "$TEMP_DIR/"
@@ -156,42 +160,90 @@ instalar_aplicacion() {
       cd "$(ls -1 .)" || error "No se pudo acceder a la subcarpeta."
     fi
 
-    info "Analizando el contenido de la aplicación..."
-    mapfile -t EXECUTABLES < <(find_executables "$PWD")
-    [ ${#EXECUTABLES[@]} -eq 0 ] && error "No se encontraron archivos ejecutables."
+    # ==========================================
+    # ANÁLISIS INTELIGENTE Y DETECCIÓN
+    # ==========================================
+    OFFICIAL_DESKTOP=$(find . -maxdepth 2 -type f -name "*.desktop" | head -n 1)
 
-    info "Selecciona el ejecutable principal (se muestran los más probables primero):"
-    PS3="Selecciona el número del ejecutable: "
-    select EXEC_PATH in "${EXECUTABLES[@]}"; do
-      if [[ -n "${EXEC_PATH:-}" ]]; then break; else warn "Selección inválida."; fi
-    done
-  fi
+    if [ -n "$OFFICIAL_DESKTOP" ]; then
+      info "Se detectó un paquete oficial con .desktop: $(basename "$OFFICIAL_DESKTOP")"
+      IS_OFFICIAL=true
+      
+      # 1. Autocompletar el Nombre sin preguntar
+      APP_NAME=$(grep "^Name=" "$OFFICIAL_DESKTOP" | cut -d= -f2- | head -n 1)
+      if [ -z "$APP_NAME" ]; then APP_NAME="App_Desconocida"; fi
+      success "Nombre detectado automáticamente: $APP_NAME"
 
-  check_binary_dependencies "$EXEC_PATH"
+      # 2. Extraer y detectar el Ejecutable
+      local RAW_EXEC
+      RAW_EXEC=$(grep "^Exec=" "$OFFICIAL_DESKTOP" | cut -d= -f2- | head -n 1 | awk '{print $1}')
+      RAW_EXEC=$(basename "$RAW_EXEC") 
+      
+      EXEC_PATH=$(find . -type f -name "$RAW_EXEC" | head -n 1)
+      
+      if [ -z "$EXEC_PATH" ]; then
+         warn "El .desktop indica el ejecutable '$RAW_EXEC', pero no se encontró en el archivo."
+         warn "Pasando a modo de instalación manual..."
+         IS_OFFICIAL=false
+      else
+         success "Ejecutable vinculado automáticamente: $EXEC_PATH"
+      fi
 
-  local ICON_PATH=""
-  if [ -f "$EXEC_PATH" ]; then
-    mapfile -t ICONS < <(find_icons "$PWD")
-    if [ ${#ICONS[@]} -gt 0 ]; then
-      info "Selecciona un icono (opcional, se muestran los de alta resolución primero):"
-      ICONS+=("No seleccionar ningún icono")
-      PS3="Selecciona el número del icono: "
-      select ICON_CANDIDATE in "${ICONS[@]}"; do
-        if [[ -n "${ICON_CANDIDATE:-}" && "$ICON_CANDIDATE" != "No seleccionar ningún icono" ]]; then
-          ICON_PATH="$ICON_CANDIDATE"; break
-        elif [[ "$ICON_CANDIDATE" == "No seleccionar ningún icono" ]]; then
-          info "Se omitió la selección de icono."; break
-        else
-          warn "Selección inválida."
-        fi
+      # 3. Extraer y detectar el Icono
+      if [ "$IS_OFFICIAL" = true ]; then
+          local RAW_ICON
+          RAW_ICON=$(grep "^Icon=" "$OFFICIAL_DESKTOP" | cut -d= -f2- | head -n 1)
+          if [ -n "$RAW_ICON" ]; then
+             ICON_PATH=$(find . -type f -name "$(basename "$RAW_ICON")*" | head -n 1)
+             if [ -n "$ICON_PATH" ]; then
+                 ICON_PATH=$(echo "$ICON_PATH" | sed 's/^\.\///') 
+                 success "Icono detectado automáticamente: $ICON_PATH"
+             fi
+          fi
+      fi
+    fi
+
+    # ==========================================
+    # MODO MANUAL (Fallback)
+    # ==========================================
+    if [ "$IS_OFFICIAL" = false ]; then
+      info "Analizando el contenido de la aplicación (Modo manual)..."
+      
+      local EXECUTABLES
+      mapfile -t EXECUTABLES < <(find_executables "$PWD")
+      [ ${#EXECUTABLES[@]} -eq 0 ] && error "No se encontraron archivos ejecutables."
+
+      info "Selecciona el ejecutable principal:"
+      PS3="Selecciona el número del ejecutable: "
+      select EXEC_PATH in "${EXECUTABLES[@]}"; do
+        if [[ -n "${EXEC_PATH:-}" ]]; then break; else warn "Selección inválida."; fi
       done
-    else
-      warn "No se encontraron archivos de icono."
+
+      local ICONS
+      mapfile -t ICONS < <(find_icons "$PWD")
+      if [ ${#ICONS[@]} -gt 0 ]; then
+        info "Selecciona un icono (opcional):"
+        ICONS+=("No seleccionar ningún icono")
+        PS3="Selecciona el número del icono: "
+        select ICON_CANDIDATE in "${ICONS[@]}"; do
+          if [[ -n "${ICON_CANDIDATE:-}" && "$ICON_CANDIDATE" != "No seleccionar ningún icono" ]]; then
+            ICON_PATH="$ICON_CANDIDATE"; break
+          elif [[ "$ICON_CANDIDATE" == "No seleccionar ningún icono" ]]; then
+            info "Se omitió la selección de icono."; break
+          else
+            warn "Selección inválida."
+          fi
+        done
+      else
+        warn "No se encontraron archivos de icono."
+      fi
+
+      echo -e "\n${CYAN}--- Configuración de la Instalación ---${DEFAULT}"
+      read -r -p "Introduce el nombre para la aplicación: " APP_NAME
     fi
   fi
 
-  echo -e "\n${CYAN}--- Configuración de la Instalación ---${DEFAULT}"
-  read -r -p "Introduce el nombre para la aplicación: " APP_NAME
+  check_binary_dependencies "$EXEC_PATH"
 
   local REGISTRY_FILE="$HOME/.config/app-installer/registry.log"
   if [ -f "$REGISTRY_FILE" ] && grep -q "^${APP_NAME}|" "$REGISTRY_FILE"; then
@@ -231,62 +283,51 @@ instalar_aplicacion() {
   local APP_COMMAND_NAME
   APP_COMMAND_NAME=$(basename "$EXEC_PATH" | sed 's/\.sh$//')
 
-  # Detectar si el ejecutable es un script .sh para abrir Terminal=true
   local TERMINAL_FLAG="false"
   [[ "$EXEC_PATH" == *.sh ]] && TERMINAL_FLAG="true"
 
+  local SUDO_CMD=""
   if [ "${NEEDS_SUDO}" = true ] && [ "$EUID" -ne 0 ]; then
     info "Se requieren privilegios de administrador."
-    sudo mkdir -p "$INSTALL_DIR" "$BIN_LINK_DIR" "$DESKTOP_DIR" || error "No se pudieron crear directorios."
-    info "Copiando archivos de la aplicación a '$INSTALL_DIR'..."
-    if [ -f "$EXEC_PATH" ]; then
-      # Copiamos todo el contenido (si estamos dentro de carpeta) o solo el binario
-      if [ -d "$PWD" ]; then
+    SUDO_CMD="sudo"
+  fi
+
+  $SUDO_CMD mkdir -p "$INSTALL_DIR" "$BIN_LINK_DIR" "$DESKTOP_DIR" || error "No se pudieron crear directorios."
+  
+  info "Copiando archivos de la aplicación a '$INSTALL_DIR'..."
+  if [ -f "$EXEC_PATH" ]; then
+    if [ -d "$PWD" ]; then
+      if [ "${NEEDS_SUDO}" = true ]; then
         sudo bash -lc "$COPY_CMD . \"$INSTALL_DIR/\"" || error "Fallo al copiar los archivos."
       else
-        sudo cp "$EXEC_PATH" "$INSTALL_DIR/" || error "Fallo al copiar el binario."
-      fi
-    else
-      sudo cp "$EXEC_PATH" "$INSTALL_DIR/" || error "Fallo al copiar el binario."
-    fi
-
-    info "Creando comando de terminal: '$APP_COMMAND_NAME'..."
-    sudo ln -sf "$INSTALL_DIR/$(basename "$EXEC_PATH")" "$BIN_LINK_DIR/$APP_COMMAND_NAME"
-
-    local DESKTOP_FILE_PATH="$DESKTOP_DIR/$APP_DIR_NAME.desktop"
-    info "Creando archivo de menú en '$DESKTOP_FILE_PATH'..."
-    sudo tee "$DESKTOP_FILE_PATH" >/dev/null <<EOL
-[Desktop Entry]
-Version=1.0
-Name=$APP_NAME
-Comment=$APP_NAME (Aplicacion instalada gracias a RichyKunBv <3)
-Exec=$BIN_LINK_DIR/$APP_COMMAND_NAME
-Terminal=$TERMINAL_FLAG
-Type=Application
-Categories=Utility;
-EOL
-    if [ -n "$ICON_PATH" ]; then echo "Icon=$INSTALL_DIR/$ICON_PATH" | sudo tee -a "$DESKTOP_FILE_PATH" >/dev/null; fi
-    sudo chmod +x "$DESKTOP_FILE_PATH"
-
-  else
-    mkdir -p "$INSTALL_DIR" "$BIN_LINK_DIR" "$DESKTOP_DIR" || error "No se pudieron crear directorios."
-    info "Copiando archivos de la aplicación a '$INSTALL_DIR'..."
-    if [ -f "$EXEC_PATH" ]; then
-      if [ -d "$PWD" ]; then
         bash -lc "$COPY_CMD . \"$INSTALL_DIR/\"" || error "Fallo al copiar los archivos."
-      else
-        cp "$EXEC_PATH" "$INSTALL_DIR/" || error "Fallo al copiar el binario."
       fi
     else
-      cp "$EXEC_PATH" "$INSTALL_DIR/" || error "Fallo al copiar el binario."
+      $SUDO_CMD cp "$EXEC_PATH" "$INSTALL_DIR/" || error "Fallo al copiar el binario."
     fi
+  else
+    $SUDO_CMD cp "$EXEC_PATH" "$INSTALL_DIR/" || error "Fallo al copiar el binario."
+  fi
 
-    info "Creando comando de terminal: '$APP_COMMAND_NAME'..."
-    ln -sf "$INSTALL_DIR/$(basename "$EXEC_PATH")" "$BIN_LINK_DIR/$APP_COMMAND_NAME"
+  info "Creando comando de terminal: '$APP_COMMAND_NAME'..."
+  $SUDO_CMD ln -sf "$INSTALL_DIR/$(basename "$EXEC_PATH")" "$BIN_LINK_DIR/$APP_COMMAND_NAME"
 
-    local DESKTOP_FILE_PATH="$DESKTOP_DIR/$APP_DIR_NAME.desktop"
-    info "Creando archivo de menú en '$DESKTOP_FILE_PATH'..."
-    cat > "$DESKTOP_FILE_PATH" <<EOL
+  local DESKTOP_FILE_PATH="$DESKTOP_DIR/$APP_DIR_NAME.desktop"
+  
+  if [ "$IS_OFFICIAL" = true ]; then
+      info "Adaptando archivo .desktop oficial para el sistema..."
+      $SUDO_CMD cp "$OFFICIAL_DESKTOP" "$DESKTOP_FILE_PATH"
+      $SUDO_CMD sed -i "s|^Exec=.*|Exec=$BIN_LINK_DIR/$APP_COMMAND_NAME|" "$DESKTOP_FILE_PATH"
+      
+      if [ -n "$ICON_PATH" ]; then
+          $SUDO_CMD sed -i "s|^Icon=.*|Icon=$INSTALL_DIR/$ICON_PATH|" "$DESKTOP_FILE_PATH"
+      fi
+      
+      $SUDO_CMD chmod +x "$DESKTOP_FILE_PATH"
+  else
+      info "Creando archivo de menú nativo en '$DESKTOP_FILE_PATH'..."
+      if [ "${NEEDS_SUDO}" = true ]; then
+          sudo tee "$DESKTOP_FILE_PATH" >/dev/null <<EOL
 [Desktop Entry]
 Version=1.0
 Name=$APP_NAME
@@ -296,9 +337,26 @@ Terminal=$TERMINAL_FLAG
 Type=Application
 Categories=Utility;
 EOL
-    if [ -n "$ICON_PATH" ]; then echo "Icon=$INSTALL_DIR/$ICON_PATH" >> "$DESKTOP_FILE_PATH"; fi
-    chmod +x "$DESKTOP_FILE_PATH"
+          if [ -n "$ICON_PATH" ]; then echo "Icon=$INSTALL_DIR/$ICON_PATH" | sudo tee -a "$DESKTOP_FILE_PATH" >/dev/null; fi
+          sudo chmod +x "$DESKTOP_FILE_PATH"
+      else
+          cat > "$DESKTOP_FILE_PATH" <<EOL
+[Desktop Entry]
+Version=1.0
+Name=$APP_NAME
+Comment=$APP_NAME (Aplicacion instalada gracias a RichyKunBv <3)
+Exec=$BIN_LINK_DIR/$APP_COMMAND_NAME
+Terminal=$TERMINAL_FLAG
+Type=Application
+Categories=Utility;
+EOL
+          if [ -n "$ICON_PATH" ]; then echo "Icon=$INSTALL_DIR/$ICON_PATH" >> "$DESKTOP_FILE_PATH"; fi
+          chmod +x "$DESKTOP_FILE_PATH"
+      fi
   fi
+  
+  # Garantizamos que el ejecutable copiado tenga permisos para arrancar
+  $SUDO_CMD chmod +x "$INSTALL_DIR/$(basename "$EXEC_PATH")"
 
   success "¡Instalación completada!"
   info "Guardando información en el registro..."
